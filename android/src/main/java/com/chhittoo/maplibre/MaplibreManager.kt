@@ -42,7 +42,7 @@ import org.maplibre.android.style.layers.PropertyFactory
 import org.maplibre.android.style.layers.SymbolLayer
 import org.maplibre.android.style.sources.GeoJsonSource
 import org.maplibre.android.style.sources.VectorSource
-
+import org.maplibre.android.location.engine.LocationEngineRequest
 // ─────────────────────────────────────────────
 // MapTouchForwarder — transparent view above
 // the WebView that routes map-area touches to
@@ -253,7 +253,6 @@ class MaplibreManager(
 
         val lc = map.locationComponent
 
-        // Build nice-looking location indicator options
         val options = LocationComponentOptions.builder(activity)
             .accuracyAnimationEnabled(true)
             .accuracyAlpha(0.12f)
@@ -261,10 +260,18 @@ class MaplibreManager(
             .elevation(5f)
             .build()
 
+        // High accuracy — uses GPS chip, not just cell towers / WiFi
+        val locationEngineRequest = LocationEngineRequest.Builder(1000L)
+            .setPriority(LocationEngineRequest.PRIORITY_HIGH_ACCURACY)
+            .setFastestInterval(500L)   // never update faster than 500ms
+            .setDisplacement(1f)        // only update if moved at least 1 metre
+            .build()
+
         val activationOptions = LocationComponentActivationOptions
             .builder(activity, style)
             .locationComponentOptions(options)
             .useDefaultLocationEngine(true)
+            .locationEngineRequest(locationEngineRequest)  // ← attach it here
             .build()
 
         if (!locationActivated) {
