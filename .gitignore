@@ -1,0 +1,39 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+
+# Android build artifacts
+android/.gradle/
+android/build/
+android/app/build/
+android/.idea/
+*.iml
+*.iws
+.idea/
+local.properties
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editor configs
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Dist (if you add a TypeScript build step later)
+dist/
+
+# Test app artifacts
+www/

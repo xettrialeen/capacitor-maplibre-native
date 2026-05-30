@@ -1,0 +1,22 @@
+# Exclude from the npm package — keep it small and clean
+
+# Android build output (not needed by consumers)
+android/.gradle/
+android/build/
+android/.idea/
+*.iml
+
+# Development files
+node_modules/
+.DS_Store
+.vscode/
+*.log
+
+# Test / example app
+www/
+
+# CI/CD
+.github/
+
+# Source maps (not needed for a plugin)
+*.map

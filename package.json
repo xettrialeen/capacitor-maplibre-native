@@ -1,0 +1,59 @@
+{
+  "name": "capacitor-maplibre-native",
+  "version": "1.0.0",
+  "description": "Native MapLibre GL map plugin for Capacitor 7. GPU-accelerated real native MapView — not a WebView map. Built for ride-sharing and navigation apps.",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "module": "src/index.js",
+  "exports": {
+    ".": {
+      "import": "./src/index.js",
+      "require": "./src/index.js",
+      "types": "./src/index.d.ts"
+    }
+  },
+  "files": [
+    "src/",
+    "android/",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "capacitor",
+    "capacitor-plugin",
+    "maplibre",
+    "maplibre-native",
+    "map",
+    "android",
+    "navigation",
+    "ride-sharing",
+    "gps",
+    "compass",
+    "native"
+  ],
+  "author": "Yashitech Solutions Pvt. Ltd.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xettrialeen/capacitor-maplibre-native.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xettrialeen/capacitor-maplibre-native/issues"
+  },
+  "homepage": "https://github.com/xettrialeen/capacitor-maplibre-native#readme",
+  "peerDependencies": {
+    "@capacitor/core": "^7.0.0"
+  },
+  "devDependencies": {
+    "@capacitor/core": "^7.0.0"
+  },
+  "capacitor": {
+    "android": {
+      "src": "android"
+    }
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
