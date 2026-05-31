@@ -63,11 +63,21 @@ class ChhittooMapPlugin : Plugin() {
 
     // ── Driver marker ─────────────────────────────────────────────────────────
     @PluginMethod fun updateDriverMarker(call: PluginCall) {
-        val lat = call.getDouble("lat") ?: return
-        val lng = call.getDouble("lng") ?: return
+        val lat      = call.getDouble("lat")     ?: return
+        val lng      = call.getDouble("lng")     ?: return
+        val bearing  = (call.getDouble("bearing") ?: 0.0).toFloat()
+        val duration = call.getInt("duration")   ?: 1000
         activity.runOnUiThread {
-            manager?.updateDriverMarker(lat, lng, (call.getDouble("bearing") ?: 0.0).toFloat(), call.getInt("duration") ?: 1000)
-            call.resolve()
+            val progress = manager?.updateDriverMarker(lat, lng, bearing, duration)
+            val result   = JSObject()
+            progress?.let {
+                result.put("distanceRemaining", Math.round(it.distanceRemainingKm * 100.0) / 100.0)
+                result.put("distanceTraveled",  Math.round(it.distanceTraveledKm  * 100.0) / 100.0)
+                result.put("totalDistance",     Math.round(it.totalDistanceKm     * 100.0) / 100.0)
+                result.put("percentComplete",   Math.round(it.percentComplete * 10.0) / 10.0)
+                result.put("etaMinutes",        it.etaMinutes)
+            }
+            call.resolve(result)
         }
     }
 

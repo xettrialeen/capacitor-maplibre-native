@@ -42,42 +42,12 @@ import org.maplibre.android.style.layers.PropertyFactory
 import org.maplibre.android.style.layers.SymbolLayer
 import org.maplibre.android.style.sources.GeoJsonSource
 import org.maplibre.android.style.sources.VectorSource
-import org.maplibre.android.location.engine.LocationEngineRequest
-// ─────────────────────────────────────────────
-// MapTouchForwarder — transparent view above
-// the WebView that routes map-area touches to
-// the native MapView.
-//
-// THREE fixes for reliable two-finger rotation:
-//
-// FIX A — MotionEvent.obtain(event)
-//   Android RECYCLES touch events after delivery.
-//   If we pass the original event object to MapView
-//   it may already be recycled by the time MapLibre's
-//   gesture detector processes it. obtain() creates
-//   an owned copy we control the lifecycle of.
-//
-// FIX B — requestDisallowInterceptTouchEvent(true)
-//   Once a gesture starts, tell the parent ViewGroup
-//   not to steal events (e.g. WebView scroll can
-//   intercept mid-gesture and cancel rotation).
-//
-// FIX C — isMotionEventSplittingEnabled = false
-//   (set on the parent in create())
-//   Android can SPLIT multi-touch events between
-//   different child views. First finger → Forwarder,
-//   second finger → WebView. This breaks rotation
-//   because MapLibre needs BOTH pointers. Disabling
-//   splitting ensures all pointers in a gesture
-//   sequence go to the same view that got ACTION_DOWN.
-// ─────────────────────────────────────────────
+import kotlin.math.*
+
 class MapTouchForwarder(context: Context) : View(context) {
     var target: MapView? = null
-
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val mv = target ?: return false
-
-        // FIX B: once a gesture starts, block parent interception
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN,
             MotionEvent.ACTION_POINTER_DOWN ->
@@ -87,16 +57,33 @@ class MapTouchForwarder(context: Context) : View(context) {
             MotionEvent.ACTION_CANCEL ->
                 parent?.requestDisallowInterceptTouchEvent(false)
         }
-
-        // FIX A: copy the event — Android recycles the original
-        // after onTouchEvent returns; MapLibre reads it asynchronously
         val copy = MotionEvent.obtain(event)
         mv.dispatchTouchEvent(copy)
         copy.recycle()
-
         return true
     }
 }
+
+// ─────────────────────────────────────────────
+// Marker data — persists across style switches
+// so markers are automatically re-drawn when tiles change
+// ─────────────────────────────────────────────
+data class MarkerData(
+    val lat: Double, val lng: Double,
+    val iconName: String, val title: String
+)
+
+// ─────────────────────────────────────────────
+// Route progress data returned to JS on every
+// driver position update when a route is active
+// ─────────────────────────────────────────────
+data class RouteProgress(
+    val distanceRemainingKm: Double,
+    val distanceTraveledKm: Double,
+    val totalDistanceKm: Double,
+    val percentComplete: Double,
+    val etaMinutes: Int
+)
 
 class MaplibreManager(
     private val bridge: Bridge,
@@ -108,30 +95,42 @@ class MaplibreManager(
     private var currentStyle: Style? = null
     private var locationActivated = false
 
-    private var driverLatLng        = LatLng(0.0, 0.0)
+    private var driverLatLng       = LatLng(0.0, 0.0)
     private var driverAnimator: ValueAnimator? = null
     private var cityTourAnimator: ValueAnimator? = null
-    private var lastDriverBearing   = 0f
-    private var is3DBuildingsOn     = false
-    private var is3DTerrainOn       = false
+    private var lastDriverBearing  = 0f
+    private var is3DBuildingsOn    = false
+    private var is3DTerrainOn      = false
 
-    private val DRIVER_SOURCE_ID    = "chhittoo-driver-source"
-    private val DRIVER_LAYER_ID     = "chhittoo-driver-layer"
-    private val ROUTE_SOURCE_ID     = "chhittoo-route-source"
-    private val ROUTE_LAYER_ID      = "chhittoo-route-layer"
-    private val ROUTE_BORDER_ID     = "chhittoo-route-border"
-    private val BUILDINGS_LAYER_ID  = "chhittoo-3d-buildings"
-    private val DRIVER_ICON         = "chhittoo-driver-icon"
-    private val PICKUP_ICON         = "chhittoo-pickup-icon"
-    private val DROPOFF_ICON        = "chhittoo-dropoff-icon"
-    private val RIDER_ICON          = "chhittoo-rider-icon"
+    // Route progress — store full coordinates so we can split them
+    // as the driver advances along the route
+    private var routePoints = listOf<Pair<Double, Double>>() // (lng, lat)
 
-    private val markerSources = mutableMapOf<String, GeoJsonSource>()
-    private val markerLayers  = mutableMapOf<String, SymbolLayer>()
-    private var currentMode   = "rider"
+    // Layer / source IDs
+    private val DRIVER_SOURCE_ID       = "chhittoo-driver-source"
+    private val DRIVER_LAYER_ID        = "chhittoo-driver-layer"
+    private val ROUTE_SOURCE_ID        = "chhittoo-route-source"        // remaining portion
+    private val ROUTE_LAYER_ID         = "chhittoo-route-layer"
+    private val ROUTE_BORDER_ID        = "chhittoo-route-border"
+    private val ROUTE_TRAVELED_SOURCE  = "chhittoo-route-traveled"      // completed portion
+    private val ROUTE_TRAVELED_LAYER   = "chhittoo-route-traveled-layer"
+    private val BUILDINGS_LAYER_ID     = "chhittoo-3d-buildings"
+    private val DRIVER_ICON            = "chhittoo-driver-icon"
+    private val PICKUP_ICON            = "chhittoo-pickup-icon"
+    private val DROPOFF_ICON           = "chhittoo-dropoff-icon"
+    private val RIDER_ICON             = "chhittoo-rider-icon"
+
+    private val markerSources  = mutableMapOf<String, GeoJsonSource>()
+    private val markerLayers   = mutableMapOf<String, SymbolLayer>()
+    // Marker data survives style switches — sources/layers don't, but positions do
+    private val markerDataMap  = mutableMapOf<String, MarkerData>()
+    // Route style survives style switches so the line colour/width is preserved
+    private var routeColor     = "#18181b"
+    private var routeWidth     = 4f
+    private var currentMode    = "rider"
 
     // ─────────────────────────────────────────────
-    // STYLE: inline JSON vs URL
+    // STYLE helper
     // ─────────────────────────────────────────────
 
     private fun applyStyle(map: MapLibreMap, styleStr: String, onLoaded: Style.OnStyleLoaded) {
@@ -156,6 +155,7 @@ class MaplibreManager(
                 currentMode = mode
                 is3DBuildingsOn = false; is3DTerrainOn = false
                 locationActivated = false
+                routePoints = emptyList()
 
                 val cameraPos = CameraPosition.Builder()
                     .target(LatLng(lat, lng))
@@ -164,11 +164,6 @@ class MaplibreManager(
                     .bearing(0.0).build()
 
                 val parent = bridge.webView.parent as ViewGroup
-
-                // FIX C: disable touch event splitting so ALL pointers in a
-                // multi-finger gesture go to the same child view (MapTouchForwarder).
-                // Without this, Android may route the second finger to the WebView,
-                // breaking rotation because MapLibre needs both pointers.
                 parent.isMotionEventSplittingEnabled = false
 
                 mapView = MapView(activity)
@@ -211,11 +206,11 @@ class MaplibreManager(
         driverAnimator?.cancel(); cityTourAnimator?.cancel()
         mapView?.onPause(); mapView?.onStop(); mapView?.onDestroy()
         val parent = bridge.webView.parent as? ViewGroup
-        // Restore split touch events for the rest of the app
         parent?.isMotionEventSplittingEnabled = true
         parent?.removeView(touchForwarder); parent?.removeView(mapView)
         touchForwarder = null; mapView = null; maplibreMap = null; currentStyle = null
-        markerSources.clear(); markerLayers.clear()
+        markerSources.clear(); markerLayers.clear(); markerDataMap.clear()
+        routePoints = emptyList(); routeColor = "#18181b"; routeWidth = 4f
         is3DBuildingsOn = false; is3DTerrainOn = false; locationActivated = false
     }
 
@@ -225,100 +220,6 @@ class MaplibreManager(
             v.layoutParams = v.layoutParams.also { it.width = widthPx; it.height = heightPx }
             v.requestLayout()
         }
-    }
-
-    // ─────────────────────────────────────────────
-    // ██  CURRENT LOCATION + COMPASS NAVIGATION  ██
-    //
-    // enableLocationDot()   — shows blue dot, centers on user, north-up map
-    // enableCompassMode()   — map ROTATES with phone compass, like Google Maps nav
-    //                         When you turn the phone the map turns with it.
-    //                         The blue cone shows which direction you face.
-    // disableLocation()     — removes dot and stops following
-    // ─────────────────────────────────────────────
-
-    private fun hasLocationPermission(): Boolean =
-        ActivityCompat.checkSelfPermission(activity, Manifest.permission.ACCESS_FINE_LOCATION) ==
-                PackageManager.PERMISSION_GRANTED
-
-    /**
-     * Activates the MapLibre LocationComponent (the blue dot) and optionally
-     * sets the tracking/render mode.
-     */
-    @Suppress("DEPRECATION")
-    private fun activateLocation(camMode: Int, renderMode: Int) {
-        val map   = maplibreMap ?: return
-        val style = currentStyle ?: return
-        if (!hasLocationPermission()) return
-
-        val lc = map.locationComponent
-
-        val options = LocationComponentOptions.builder(activity)
-            .accuracyAnimationEnabled(true)
-            .accuracyAlpha(0.12f)
-            .accuracyColor(Color.parseColor("#4A90E2"))
-            .elevation(5f)
-            .build()
-
-        // High accuracy — uses GPS chip, not just cell towers / WiFi
-        val locationEngineRequest = LocationEngineRequest.Builder(1000L)
-            .setPriority(LocationEngineRequest.PRIORITY_HIGH_ACCURACY)
-            .setFastestInterval(500L)   // never update faster than 500ms
-            .setDisplacement(1f)        // only update if moved at least 1 metre
-            .build()
-
-        val activationOptions = LocationComponentActivationOptions
-            .builder(activity, style)
-            .locationComponentOptions(options)
-            .useDefaultLocationEngine(true)
-            .locationEngineRequest(locationEngineRequest)  // ← attach it here
-            .build()
-
-        if (!locationActivated) {
-            lc.activateLocationComponent(activationOptions)
-            locationActivated = true
-        }
-
-        lc.isLocationComponentEnabled = true
-        lc.cameraMode  = camMode
-        lc.renderMode  = renderMode
-    }
-
-    /**
-     * Shows the blue location dot.
-     * Camera centers on user but map stays north-up.
-     */
-    fun enableLocationDot() = activateLocation(CameraMode.TRACKING, RenderMode.COMPASS)
-
-    /**
-     * Full compass navigation mode — exactly like Google Maps heading-up.
-     *
-     * CameraMode.TRACKING_COMPASS  → the camera auto-rotates to match the
-     *   phone's compass bearing.  When you turn left, the map turns left.
-     *
-     * RenderMode.COMPASS → the blue dot has a directional cone showing
-     *   which way you're facing at all times.
-     *
-     * This uses Android's sensor fusion (accelerometer + magnetometer),
-     * NOT GPS bearing, so it works even when you're standing still.
-     */
-    fun enableCompassMode() = activateLocation(CameraMode.TRACKING_COMPASS, RenderMode.COMPASS)
-
-    /**
-     * GPS navigation mode — map rotates based on GPS movement direction.
-     * Best for driving (requires actual movement to update heading).
-     * Arrow-shaped indicator instead of compass cone.
-     */
-    fun enableGpsMode() = activateLocation(CameraMode.TRACKING_GPS, RenderMode.GPS)
-
-    /**
-     * Disable location dot and stop all location following.
-     */
-    fun disableLocation() {
-        val lc = maplibreMap?.locationComponent ?: return
-        lc.isLocationComponentEnabled = false
-        lc.cameraMode = CameraMode.NONE
-        lc.renderMode  = RenderMode.NORMAL
     }
 
     // ─────────────────────────────────────────────
@@ -344,8 +245,7 @@ class MaplibreManager(
     }
 
     private fun makeFallbackCircle(color: Int): Bitmap {
-        val s = 64; val b = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
-        val c = Canvas(b)
+        val s = 64; val b = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888); val c = Canvas(b)
         c.drawCircle(32f, 32f, 28f, Paint(Paint.ANTI_ALIAS_FLAG).apply { this.color = color })
         c.drawCircle(32f, 32f, 28f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
             this.color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = 4f })
@@ -353,7 +253,7 @@ class MaplibreManager(
     }
 
     // ─────────────────────────────────────────────
-    // DRIVER + ROUTE LAYERS
+    // DRIVER LAYER
     // ─────────────────────────────────────────────
 
     private fun setupDriverLayer(style: Style, initial: LatLng) {
@@ -374,43 +274,83 @@ class MaplibreManager(
         })
     }
 
+    // ─────────────────────────────────────────────
+    // ROUTE LAYER
+    //
+    // Three layers (bottom to top):
+    //   1. traveled border  — white, wide, behind traveled line
+    //   2. traveled line    — gray, shows completed portion of route
+    //   3. remaining border — white, wide, behind remaining line
+    //   4. remaining line   — brand color, shows ahead portion
+    //
+    // As the driver moves, the split point between traveled/remaining
+    // updates on every GPS position, giving Uber-style progress.
+    // ─────────────────────────────────────────────
+
     private fun setupRouteLayer(style: Style) {
+        // Remaining route source (full route initially, shrinks as driver advances)
         style.addSource(GeoJsonSource(ROUTE_SOURCE_ID,
             FeatureCollection.fromFeatures(emptyArray<Feature>())))
+
+        // Traveled route source (empty initially, grows as driver advances)
+        style.addSource(GeoJsonSource(ROUTE_TRAVELED_SOURCE,
+            FeatureCollection.fromFeatures(emptyArray<Feature>())))
+
+        // White border behind remaining route
         style.addLayerBelow(LineLayer(ROUTE_BORDER_ID, ROUTE_SOURCE_ID).apply {
             setProperties(
                 PropertyFactory.lineColor(Color.WHITE), PropertyFactory.lineWidth(9f),
                 PropertyFactory.lineJoin("round"), PropertyFactory.lineCap("round"),
                 PropertyFactory.lineOpacity(0.9f))
         }, DRIVER_LAYER_ID)
+
+        // Remaining route — main color, full width
         style.addLayerBelow(LineLayer(ROUTE_LAYER_ID, ROUTE_SOURCE_ID).apply {
             setProperties(
-                PropertyFactory.lineColor("#4A90E2"), PropertyFactory.lineWidth(5f),
+                PropertyFactory.lineColor("#18181b"), PropertyFactory.lineWidth(5f),
                 PropertyFactory.lineJoin("round"), PropertyFactory.lineCap("round"))
         }, DRIVER_LAYER_ID)
+
+        // Traveled route — gray, slightly thinner (below remaining so overlap looks clean)
+        style.addLayerBelow(LineLayer(ROUTE_TRAVELED_LAYER, ROUTE_TRAVELED_SOURCE).apply {
+            setProperties(
+                PropertyFactory.lineColor("#9ca3af"), PropertyFactory.lineWidth(4f),
+                PropertyFactory.lineJoin("round"), PropertyFactory.lineCap("round"),
+                PropertyFactory.lineOpacity(0.8f))
+        }, ROUTE_LAYER_ID)
     }
 
     // ─────────────────────────────────────────────
-    // DRIVER ANIMATION
+    // DRIVER ANIMATION + ROUTE PROGRESS
     // ─────────────────────────────────────────────
 
-    fun updateDriverMarker(lat: Double, lng: Double, bearing: Float, durationMs: Int) {
-        val map   = maplibreMap ?: return
-        val style = currentStyle ?: return
+    fun updateDriverMarker(lat: Double, lng: Double, bearing: Float, durationMs: Int): RouteProgress? {
+        val map   = maplibreMap ?: return null
+        val style = currentStyle ?: return null
         val to    = LatLng(lat, lng)
+
         driverAnimator?.cancel()
         driverAnimator = ValueAnimator.ofObject(LatLngEvaluator(), driverLatLng, to).apply {
             duration = durationMs.toLong(); interpolator = LinearInterpolator()
             addUpdateListener { anim ->
+                // Use currentStyle / maplibreMap (live properties) — NOT the 'style'
+                // and 'map' values captured at animation-start time.
+                // When the user switches tiles, MapLibre destroys the old Style object.
+                // The closed-over 'style' would then point to a dead object, crashing
+                // on getSourceAs(). Using the live property means we either get the
+                // new style (correct) or null (safe no-op via ?.).
+                val activeStyle = currentStyle ?: return@addUpdateListener
+                val activeMap   = maplibreMap  ?: return@addUpdateListener
+
                 val pos = anim.animatedValue as LatLng
                 val ib  = interpolateBearing(lastDriverBearing, bearing, anim.animatedFraction)
                 val f   = Feature.fromGeometry(Point.fromLngLat(pos.longitude, pos.latitude))
                 f.addNumberProperty("bearing", ib)
-                style.getSourceAs<GeoJsonSource>(DRIVER_SOURCE_ID)
+                activeStyle.getSourceAs<GeoJsonSource>(DRIVER_SOURCE_ID)
                     ?.setGeoJson(FeatureCollection.fromFeature(f))
                 driverLatLng = pos
                 if (currentMode == "driver") {
-                    map.moveCamera(CameraUpdateFactory.newCameraPosition(
+                    activeMap.moveCamera(CameraUpdateFactory.newCameraPosition(
                         CameraPosition.Builder().target(pos).zoom(17.0).tilt(45.0)
                             .bearing(ib.toDouble()).build()))
                 }
@@ -420,6 +360,82 @@ class MaplibreManager(
             })
         }
         driverAnimator!!.start()
+
+        // Update route split at new driver position and return progress to JS
+        return splitRouteAtDriver(lat, lng)
+    }
+
+    // ─────────────────────────────────────────────
+    // ROUTE PROGRESS — split and measure
+    // ─────────────────────────────────────────────
+
+    private fun splitRouteAtDriver(driverLat: Double, driverLng: Double): RouteProgress? {
+        val style = currentStyle ?: return null
+        if (routePoints.size < 2) return null
+
+        // Find the index of the nearest route point to the driver
+        var nearestIdx = 0
+        var minDist    = Double.MAX_VALUE
+        routePoints.forEachIndexed { i, (lng, lat) ->
+            val d = haversineKm(driverLat, driverLng, lat, lng)
+            if (d < minDist) { minDist = d; nearestIdx = i }
+        }
+
+        // Traveled: start → nearestIdx (inclusive)
+        val traveledPts  = routePoints.subList(0, nearestIdx + 1)
+        // Remaining: nearestIdx → end
+        val remainingPts = routePoints.subList(nearestIdx, routePoints.size)
+
+        // Update traveled source
+        if (traveledPts.size >= 2) {
+            val line = Feature.fromGeometry(
+                LineString.fromLngLats(traveledPts.map { Point.fromLngLat(it.first, it.second) }))
+            style.getSourceAs<GeoJsonSource>(ROUTE_TRAVELED_SOURCE)
+                ?.setGeoJson(FeatureCollection.fromFeature(line))
+        }
+
+        // Update remaining source
+        if (remainingPts.size >= 2) {
+            val line = Feature.fromGeometry(
+                LineString.fromLngLats(remainingPts.map { Point.fromLngLat(it.first, it.second) }))
+            style.getSourceAs<GeoJsonSource>(ROUTE_SOURCE_ID)
+                ?.setGeoJson(FeatureCollection.fromFeature(line))
+        } else {
+            // Driver has passed all route points — clear remaining
+            style.getSourceAs<GeoJsonSource>(ROUTE_SOURCE_ID)
+                ?.setGeoJson(FeatureCollection.fromFeatures(emptyArray<Feature>()))
+        }
+
+        // Calculate distances
+        val totalDist    = routePoints.zipWithNext { (lng1, lat1), (lng2, lat2) ->
+            haversineKm(lat1, lng1, lat2, lng2) }.sum()
+        val traveledDist = if (traveledPts.size >= 2)
+            traveledPts.zipWithNext { (lng1, lat1), (lng2, lat2) ->
+                haversineKm(lat1, lng1, lat2, lng2) }.sum()
+        else 0.0
+        val remainingDist = (totalDist - traveledDist).coerceAtLeast(0.0)
+        val pct           = if (totalDist > 0) (traveledDist / totalDist * 100.0) else 0.0
+
+        // ETA at average 30 km/h urban speed
+        val etaMins = if (remainingDist > 0) (remainingDist / 30.0 * 60.0).toInt().coerceAtLeast(1) else 0
+
+        return RouteProgress(
+            distanceRemainingKm = remainingDist,
+            distanceTraveledKm  = traveledDist,
+            totalDistanceKm     = totalDist,
+            percentComplete     = pct,
+            etaMinutes          = etaMins
+        )
+    }
+
+    // Haversine great-circle distance in kilometres
+    private fun haversineKm(lat1: Double, lng1: Double, lat2: Double, lng2: Double): Double {
+        val R    = 6371.0
+        val dLat = Math.toRadians(lat2 - lat1)
+        val dLng = Math.toRadians(lng2 - lng1)
+        val a    = sin(dLat / 2).pow(2) +
+                   cos(Math.toRadians(lat1)) * cos(Math.toRadians(lat2)) * sin(dLng / 2).pow(2)
+        return R * 2 * atan2(sqrt(a), sqrt(1 - a))
     }
 
     private fun interpolateBearing(from: Float, to: Float, fraction: Float): Float {
@@ -429,82 +445,109 @@ class MaplibreManager(
     }
 
     // ─────────────────────────────────────────────
-    // ██  MARKERS  ██
+    // MARKERS
     //
-    // FIX HISTORY:
-    //   • Expression.literal(arrayOf(...)) was causing setProperties() to
-    //     silently drop ALL properties including iconImage — marker invisible.
-    //     Fixed: use arrayOf() directly for textOffset.
-    //   • style.getLayerAs(layerId)!! could NPE — removed the !! operator.
-    //   • GeoJsonSource constructor now throws instead of silent-return so
-    //     errors surface back to JS via call.reject().
+    // FIX: split into two separate SymbolLayers.
+    //
+    // Root cause of "markers only show on Bright":
+    // A single SymbolLayer that has BOTH iconImage and textField
+    // fails silently on styles without a "glyphs" URL (raster styles
+    // like Google/ESRI) and on some vector styles where glyph loading
+    // fails — MapLibre suppresses the ENTIRE symbol (including the icon)
+    // if any property in the layer has a rendering error.
+    //
+    // Fix: icon-only layer (always renders) + text-only layer (optional,
+    // fails independently without taking down the icon).
     // ─────────────────────────────────────────────
 
     fun setMarker(id: String, lat: Double, lng: Double, iconName: String, title: String) {
-        // Throw so the plugin can reject() the JS call — no more silent failures
-        val style = currentStyle
-            ?: throw IllegalStateException("Map style not loaded yet")
-
+        val style   = currentStyle ?: throw IllegalStateException("Map style not loaded yet")
         val iconId  = mapIconName(iconName)
         val srcId   = "marker-src-$id"
-        val layerId = "marker-layer-$id"
+        val iconLid = "marker-icon-$id"
+        val textLid = "marker-text-$id"
 
         val feature = Feature.fromGeometry(Point.fromLngLat(lng, lat))
         if (title.isNotEmpty()) feature.addStringProperty("title", title)
 
-        // Marker already exists — just move it, don't re-create source/layer
+        // Marker already exists — just move it
         val existing = markerSources[id]
         if (existing != null) {
-            existing.setGeoJson(feature)   // ← pass Feature directly, no FeatureCollection wrapper
+            existing.setGeoJson(feature)
             return
         }
 
-        // First placement — create source + layer
-        // Use Feature directly to avoid FeatureCollection overload ambiguity
+        // ── RE-REGISTER icon right now, every time ──────────────────────────
+        // Root cause of "markers only show on CARTO":
+        // OpenFreeMap, Protomaps, ESRI, and Google styles load their sprite
+        // asynchronously AFTER OnStyleLoaded fires. When the sprite finishes
+        // loading, MapLibre clears and rebuilds its image atlas — silently
+        // removing any custom images we added in setupIcons().
+        // CARTO's CDN is fast enough that this race doesn't occur there.
+        //
+        // Fix: always call addImage immediately before creating the SymbolLayer
+        // so the image is guaranteed to exist at layer creation time, regardless
+        // of when the sprite loaded (or whether it cleared our images).
+        loadIcon(style, iconId, markerDrawable(iconName), markerFallback(iconName))
+
+        // Persist data so it survives tile switches
+        markerDataMap[id] = MarkerData(lat, lng, iconName, title)
+
+        // First placement — create source + layers
         val source = GeoJsonSource(srcId, feature)
         style.addSource(source)
         markerSources[id] = source
 
-        val layer = SymbolLayer(layerId, srcId).withProperties(
-            // Icon
+        // Icon layer — isolated from text/glyph rendering
+        style.addLayer(SymbolLayer(iconLid, srcId).withProperties(
             PropertyFactory.iconImage(iconId),
             PropertyFactory.iconAllowOverlap(true),
             PropertyFactory.iconIgnorePlacement(true),
             PropertyFactory.iconSize(1.0f),
-            PropertyFactory.iconAnchor("bottom"),
-            // Label — placed above the pin
-            PropertyFactory.textField(Expression.get("title")),
-            PropertyFactory.textSize(12f),
-            PropertyFactory.textAnchor("bottom"),
-            // textOffset takes a plain Float[] — do NOT wrap in Expression.literal()
-            // Wrapping it was the bug: Expression.literal(Array<Float>) creates an
-            // invalid expression and causes setProperties() to silently drop ALL
-            // properties in the batch, including iconImage.
-            PropertyFactory.textOffset(arrayOf(0f, -1.2f)),
-            PropertyFactory.textColor("#1a1a1a"),
-            PropertyFactory.textHaloColor("#ffffff"),
-            PropertyFactory.textHaloWidth(1.5f),
-            PropertyFactory.textAllowOverlap(false)
-        )
+            PropertyFactory.iconAnchor("bottom")
+        ))
+        style.getLayerAs<SymbolLayer>(iconLid)?.let { markerLayers[id] = it }
 
-        style.addLayer(layer)
-        style.getLayerAs<SymbolLayer>(layerId)?.let { markerLayers[id] = it }
+        // Text label — separate layer; a glyph failure won't affect the icon
+        if (title.isNotEmpty()) {
+            style.addLayer(SymbolLayer(textLid, srcId).withProperties(
+                PropertyFactory.textField(Expression.get("title")),
+                PropertyFactory.textSize(12f),
+                PropertyFactory.textAnchor("bottom"),
+                PropertyFactory.textOffset(arrayOf(0f, -2.8f)),
+                PropertyFactory.textColor("#1a1a1a"),
+                PropertyFactory.textHaloColor("#ffffff"),
+                PropertyFactory.textHaloWidth(1.5f),
+                PropertyFactory.textAllowOverlap(false)
+            ))
+        }
+    }
+
+    private fun markerDrawable(name: String): String = when (name) {
+        "driver"  -> "ic_driver_car"
+        "dropoff" -> "ic_dropoff"
+        "rider"   -> "ic_rider"
+        else      -> "ic_pickup"
+    }
+
+    private fun markerFallback(name: String): Int = when (name) {
+        "driver"  -> Color.parseColor("#18181b")
+        "dropoff" -> Color.parseColor("#E74C3C")
+        "rider"   -> Color.parseColor("#8E44AD")
+        else      -> Color.parseColor("#27AE60")
     }
 
     fun removeMarker(id: String) {
         val style = currentStyle ?: return
-        style.removeLayer("marker-layer-$id")
-        style.removeSource("marker-src-$id")
-        markerSources.remove(id)
-        markerLayers.remove(id)
+        runCatching { style.removeLayer("marker-icon-$id") }
+        runCatching { style.removeLayer("marker-text-$id") }
+        runCatching { style.removeSource("marker-src-$id") }
+        markerSources.remove(id); markerLayers.remove(id); markerDataMap.remove(id)
     }
 
     private fun mapIconName(name: String): String = when (name) {
-        "driver"  -> DRIVER_ICON
-        "pickup"  -> PICKUP_ICON
-        "dropoff" -> DROPOFF_ICON
-        "rider"   -> RIDER_ICON
-        else      -> PICKUP_ICON
+        "driver"  -> DRIVER_ICON;  "pickup"  -> PICKUP_ICON
+        "dropoff" -> DROPOFF_ICON; "rider"   -> RIDER_ICON; else -> PICKUP_ICON
     }
 
     // ─────────────────────────────────────────────
@@ -513,17 +556,89 @@ class MaplibreManager(
 
     fun setRoute(points: List<Pair<Double, Double>>, colorHex: String, widthDp: Float) {
         val style = currentStyle ?: return; if (points.isEmpty()) return
+
+        // Store everything — survives style switches
+        routePoints = points
+        routeColor  = colorHex
+        routeWidth  = widthDp
+
         val collection = FeatureCollection.fromFeature(Feature.fromGeometry(
             LineString.fromLngLats(points.map { Point.fromLngLat(it.first, it.second) })))
+
+        // Show full route in remaining layer; clear traveled
         style.getSourceAs<GeoJsonSource>(ROUTE_SOURCE_ID)?.setGeoJson(collection)
+        style.getSourceAs<GeoJsonSource>(ROUTE_TRAVELED_SOURCE)
+            ?.setGeoJson(FeatureCollection.fromFeatures(emptyArray<Feature>()))
+
         style.getLayerAs<LineLayer>(ROUTE_LAYER_ID)?.setProperties(
             PropertyFactory.lineColor(Color.parseColor(colorHex)), PropertyFactory.lineWidth(widthDp))
         style.getLayerAs<LineLayer>(ROUTE_BORDER_ID)?.setProperties(PropertyFactory.lineWidth(widthDp + 4f))
+        style.getLayerAs<LineLayer>(ROUTE_TRAVELED_LAYER)?.setProperties(
+            PropertyFactory.lineWidth((widthDp - 1f).coerceAtLeast(2f)))
     }
 
     fun clearRoute() {
-        currentStyle?.getSourceAs<GeoJsonSource>(ROUTE_SOURCE_ID)
-            ?.setGeoJson(FeatureCollection.fromFeatures(emptyArray<Feature>()))
+        val empty = FeatureCollection.fromFeatures(emptyArray<Feature>())
+        currentStyle?.getSourceAs<GeoJsonSource>(ROUTE_SOURCE_ID)?.setGeoJson(empty)
+        currentStyle?.getSourceAs<GeoJsonSource>(ROUTE_TRAVELED_SOURCE)?.setGeoJson(empty)
+        routePoints = emptyList()
+        routeColor  = "#18181b"
+        routeWidth  = 4f
+    }
+
+    // ─────────────────────────────────────────────
+    // LOCATION + COMPASS
+    // ─────────────────────────────────────────────
+
+    private fun hasLocationPermission(): Boolean =
+        ActivityCompat.checkSelfPermission(activity, Manifest.permission.ACCESS_FINE_LOCATION) ==
+                PackageManager.PERMISSION_GRANTED
+
+    @Suppress("DEPRECATION")
+    private fun activateLocation(camMode: Int, renderMode: Int) {
+        val map   = maplibreMap ?: return
+        val style = currentStyle ?: return
+        if (!hasLocationPermission()) return
+
+        val lc = map.locationComponent
+        val options = LocationComponentOptions.builder(activity)
+            .accuracyAnimationEnabled(true)
+            .accuracyAlpha(0.12f)
+            .accuracyColor(Color.parseColor("#4A90E2"))
+            .elevation(5f)
+            .build()
+
+        val locationEngineRequest =
+            org.maplibre.android.location.engine.LocationEngineRequest.Builder(1000L)
+                .setPriority(org.maplibre.android.location.engine.LocationEngineRequest.PRIORITY_HIGH_ACCURACY)
+                .setFastestInterval(500L)
+                .setDisplacement(1f)
+                .build()
+
+        val activationOptions = LocationComponentActivationOptions
+            .builder(activity, style)
+            .locationComponentOptions(options)
+            .useDefaultLocationEngine(true)
+            .locationEngineRequest(locationEngineRequest)
+            .build()
+
+        if (!locationActivated) {
+            lc.activateLocationComponent(activationOptions)
+            locationActivated = true
+        }
+        lc.isLocationComponentEnabled = true
+        lc.cameraMode  = camMode
+        lc.renderMode  = renderMode
+    }
+
+    fun enableLocationDot()  = activateLocation(CameraMode.TRACKING,         RenderMode.COMPASS)
+    fun enableCompassMode()  = activateLocation(CameraMode.TRACKING_COMPASS,  RenderMode.COMPASS)
+    fun enableGpsMode()      = activateLocation(CameraMode.TRACKING_GPS,      RenderMode.GPS)
+
+    fun disableLocation() {
+        val lc = maplibreMap?.locationComponent ?: return
+        lc.isLocationComponentEnabled = false
+        lc.cameraMode = CameraMode.NONE; lc.renderMode = RenderMode.NORMAL
     }
 
     // ─────────────────────────────────────────────
@@ -531,21 +646,17 @@ class MaplibreManager(
     // ─────────────────────────────────────────────
 
     fun enable3DBuildings() {
-        val style = currentStyle ?: return
-        if (is3DBuildingsOn) return
-        val sourceId = findVectorBuildingSource(style) ?: return
+        val style = currentStyle ?: return; if (is3DBuildingsOn) return
+        val srcId = findVectorBuildingSource(style) ?: return
         try {
-            style.addLayer(FillExtrusionLayer(BUILDINGS_LAYER_ID, sourceId).apply {
+            style.addLayer(FillExtrusionLayer(BUILDINGS_LAYER_ID, srcId).apply {
                 sourceLayer = "building"
-                setFilter(Expression.all(
-                    Expression.eq(Expression.get("extrude"), "true"),
-                    Expression.has("height")))
+                setFilter(Expression.all(Expression.eq(Expression.get("extrude"), "true"), Expression.has("height")))
                 setProperties(
                     PropertyFactory.fillExtrusionColor(
                         Expression.interpolate(Expression.linear(), Expression.zoom(),
                             Expression.stop(15, Expression.literal("#d4cdc6")),
-                            Expression.stop(17, Expression.literal("#bfb8b0")),
-                            Expression.stop(19, Expression.literal("#aba49c")))),
+                            Expression.stop(17, Expression.literal("#bfb8b0")))),
                     PropertyFactory.fillExtrusionHeight(
                         Expression.interpolate(Expression.linear(), Expression.zoom(),
                             Expression.stop(14, Expression.literal(0)),
@@ -563,23 +674,18 @@ class MaplibreManager(
     }
 
     fun disable3DBuildings() {
-        try { currentStyle?.removeLayer(BUILDINGS_LAYER_ID) } catch (_: Exception) {}
+        runCatching { currentStyle?.removeLayer(BUILDINGS_LAYER_ID) }
         is3DBuildingsOn = false
         maplibreMap?.animateCamera(CameraUpdateFactory.newCameraPosition(
             CameraPosition.Builder().tilt(0.0).build()), 800)
     }
 
     private fun findVectorBuildingSource(style: Style): String? =
-        listOf("openmaptiles", "maptiler_planet", "maptiler", "carto", "stadia", "versatiles", "composite")
+        listOf("openmaptiles","maptiler_planet","maptiler","carto","stadia","versatiles","composite")
             .firstOrNull { id -> runCatching { style.getSourceAs<VectorSource>(id) != null }.getOrDefault(false) }
 
-    // ─────────────────────────────────────────────
-    // LANDSCAPE / TERRAIN
-    // ─────────────────────────────────────────────
-
     fun enable3DTerrain() {
-        if (is3DTerrainOn) return
-        is3DTerrainOn = true
+        if (is3DTerrainOn) return; is3DTerrainOn = true
         maplibreMap?.animateCamera(CameraUpdateFactory.newCameraPosition(
             CameraPosition.Builder().tilt(60.0).zoom(11.0).build()), 1400)
     }
@@ -652,14 +758,49 @@ class MaplibreManager(
 
     fun setStyleUrl(url: String) {
         val map = maplibreMap ?: return
-        is3DBuildingsOn = false; is3DTerrainOn = false
-        locationActivated = false
-        markerSources.clear(); markerLayers.clear()
+
+        // Cancel animations before style swap — old Style object will be destroyed
+        driverAnimator?.cancel()
+        cityTourAnimator?.cancel()
+
+        // Null currentStyle immediately so any calls during the swap window
+        // (e.g. updateDriverMarker from JS setInterval) bail safely via ?: return
+        currentStyle = null
+
+        is3DBuildingsOn = false; is3DTerrainOn = false; locationActivated = false
+
+        // Clear only the MapLibre references — NOT the data.
+        // markerDataMap and routePoints/routeColor/routeWidth survive so we can
+        // re-draw everything automatically once the new style is ready.
+        markerSources.clear()
+        markerLayers.clear()
+
         applyStyle(map, url) { style ->
             currentStyle = style
+
+            // Rebuild base layers in the new style
             setupIcons(style)
             setupDriverLayer(style, driverLatLng)
             setupRouteLayer(style)
+
+            // Re-draw route if one was active
+            if (routePoints.size >= 2) {
+                val col = FeatureCollection.fromFeature(Feature.fromGeometry(
+                    LineString.fromLngLats(routePoints.map { Point.fromLngLat(it.first, it.second) })))
+                style.getSourceAs<GeoJsonSource>(ROUTE_SOURCE_ID)?.setGeoJson(col)
+                style.getLayerAs<LineLayer>(ROUTE_LAYER_ID)?.setProperties(
+                    PropertyFactory.lineColor(Color.parseColor(routeColor)),
+                    PropertyFactory.lineWidth(routeWidth))
+                style.getLayerAs<LineLayer>(ROUTE_BORDER_ID)?.setProperties(
+                    PropertyFactory.lineWidth(routeWidth + 4f))
+                style.getLayerAs<LineLayer>(ROUTE_TRAVELED_LAYER)?.setProperties(
+                    PropertyFactory.lineWidth((routeWidth - 1f).coerceAtLeast(2f)))
+            }
+
+            // Re-draw all markers — icons are re-registered inside setMarker
+            markerDataMap.forEach { (id, data) ->
+                runCatching { setMarker(id, data.lat, data.lng, data.iconName, data.title) }
+            }
         }
     }
 

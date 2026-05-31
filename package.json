@@ -1,6 +1,6 @@
 {
   "name": "capacitor-maplibre-native",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Native MapLibre GL map plugin for Capacitor 7. GPU-accelerated real native MapView \u2014 not a WebView map. Built for ride-sharing and navigation apps.",
   "main": "src/index.js",
   "types": "src/index.d.ts",
